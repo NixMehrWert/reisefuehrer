@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Reiseführer</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<style>
+  :root { --bg:#101418; --card:#1a2028; --accent:#6d4aff; --text:#e8ecf2; --dim:#8b95a5; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font-family:system-ui,-apple-system,sans-serif; background:var(--bg); color:var(--text);
+         min-height:100vh; padding:16px; padding-bottom:max(24px, env(safe-area-inset-bottom)); }
+  h1 { font-size:1.3rem; margin-bottom:12px; }
+  .status { background:var(--card); border-radius:12px; padding:14px; margin-bottom:12px;
+            line-height:1.6; font-size:.95rem; }
+  .pill { display:inline-block; padding:2px 10px; border-radius:99px; font-size:.75rem;
+          background:#2a3240; margin-right:6px; }
+  .controls { display:flex; gap:10px; margin-bottom:12px; }
+  button { flex:1; border:none; border-radius:14px; padding:18px; font-size:1.05rem; font-weight:600;
+           cursor:pointer; color:#fff; }
+  #startBtn { background:var(--accent); }
+  #startBtn.stop { background:#c0392b; }
+  #skipBtn { background:#2a3240; flex:0 0 38%; }
+  .settings { background:var(--card); border-radius:12px; padding:14px; margin-bottom:12px;
+              font-size:.9rem; }
+  .settings label { display:block; margin:8px 0 4px; color:var(--dim); }
+  .settings input { width:100%; accent-color:var(--accent); }
+  .now { background:#241f3d; border:1px solid var(--accent); border-radius:12px; padding:14px;
+         margin-bottom:12px; font-size:1rem; }
+  .log { list-style:none; font-size:.85rem; color:var(--dim); }
+  .log li { padding:6px 0; border-bottom:1px solid #232a35; }
+  .log b { color:var(--text); }
+  a.reset { color:var(--dim); font-size:.8rem; text-decoration:underline; cursor:pointer; }
+</style>
+</head>
+<body>
+<h1>🗺️ Reiseführer</h1>
+
+<div class="controls">
+  <button id="startBtn">▶ Start</button>
+  <button id="skipBtn">⏭ Überspringen</button>
+</div>
+
+<div class="status" id="status">
+  <span class="pill" id="gpsState">GPS: inaktiv</span>
+  <span class="pill" id="voiceState">Stimme: lade…</span>
+  <br><span id="info">Bereit. Start drücken und losfahren.</span>
+</div>
+
+<div class="now" id="nowBox" hidden>
+  🔊 Spricht: <b id="nowTitle"></b>
+</div>
+
+<div class="settings">
+  <label>Suchradius: <span id="radiusVal">5</span> km</label>
+  <input type="range" id="radiusInput" min="1" max="10" step="1" value="5">
+  <label>Nur Artikel mit mindestens <span id="lenVal">250</span> Zeichen (filtert Kappes)</label>
+  <input type="range" id="lenInput" min="100" max="800" step="50" value="250">
+  <a class="reset" id="resetBtn">Bereits angesagte Orte zurücksetzen</a>
+</div>
+
+<ul class="log" id="log"></ul>
+
+<script>
+'use strict';
+
+// ---------- Konfiguration ----------
+const CFG = {
+  wikiBase: 'https://de.wikipedia.org/w/api.php',
+  queryEveryKm: 3,        // neue Geo-Suche erst ab dieser Bewegung
+  minGapSec: 4            // Pause zwischen zwei Ansagen
+};
+
+// ---------- Zustand ----------
+const state = {
+  running: false,
+  watchId: null,
+  wakeLock: null,
+  lastQueryPos: null,
+  queue: [],              // [{title, text}]
+  speaking: false,
+  announced: JSON.parse(localStorage.getItem('rf_announced') || '{}'),
+  voice: null
+};
+
+const $ = id => document.getElementById(id);
+
+// ---------- Sprachausgabe ----------
+function pickVoice() {
+  const voices = speechSynthesis.getVoices();
+  // Deutsche Stimme bevorzugen, sonst Systemsprache
+  state.voice = voices.find(v => v.lang === 'de-DE')
+             || voices.find(v => v.lang && v.lang.startsWith('de'))
+             || null;
+  $('voiceState').textContent = 'Stimme: ' + (state.voice ? state.voice.name : 'Standard (Gerät)');
+}
+speechSynthesis.onvoiceschanged = pickVoice;
+pickVoice();
+
+function announce(title, text) {
+  state.queue.push({ title, text });
+  pump();
+}
+
+function pump() {
+  if (state.speaking || !state.running || state.queue.length === 0) return;
+  const item = state.queue.shift();
+  state.speaking = true;
+  $('nowBox').hidden = false;
+  $('nowTitle').textContent = item.title;
+
+  const u = new SpeechSynthesisUtterance(item.title + '. ' + item.text);
+  if (state.voice) { u.voice = state.voice; u.lang = state.voice.lang; }
+  else { u.lang = 'de-DE'; }
+  u.rate = 1.0;
+  const done = () => {
+    state.speaking = false;
+    $('nowBox').hidden = true;
+    setTimeout(pump, CFG.minGapSec * 1000);
+  };
+  u.onend = done;
+  u.onerror = done;
+  speechSynthesis.speak(u);
+}
+
+$('skipBtn').addEventListener('click', () => speechSynthesis.cancel());
+
+// ---------- Geodaten ----------
+function distKm(a, b) {
+  const R = 6371, dLat = (b.lat - a.lat) * Math.PI / 180,
+        dLon = (b.lon - a.lon) * Math.PI / 180;
+  const x = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * Math.PI / 180) *
+            Math.cos(b.lat * Math.PI / 180) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(x));
+}
+
+async function fetchPlaces(lat, lon) {
+  const radiusKm = +$('radiusInput').value;
+  const radiusM = Math.min(10000, radiusKm * 1000);
+  try {
+    const geoUrl = CFG.wikiBase +
+      '?action=query&list=geosearch&gscoord=' + lat + '%7C' + lon +
+      '&gsradius=' + radiusM + '&gslimit=50&format=json&origin=*';
+    const geo = await (await fetch(geoUrl)).json();
+    const hits = (geo.query?.geosearch || [])
+      .filter(p => p.dist <= radiusM && !state.announced[p.pageid]);
+    if (!hits.length) return;
+
+    // Extrakte (Einleitungsabsätze) für alle Kandidaten holen
+    const ids = hits.map(p => p.pageid).join('%7C');
+    const exUrl = CFG.wikiBase +
+      '?action=query&prop=extracts&exintro&explaintext&pageids=' + ids +
+      '&format=json&origin=*';
+    const ex = await (await fetch(exUrl)).json();
+    const pages = ex.query?.pages || {};
+    const minLen = +$('lenInput').value;
+
+    for (const p of hits) {
+      const extract = pages[p.pageid]?.extract || '';
+      state.announced[p.pageid] = Date.now(); // sofort merken, verhindert Doppel
+      if (extract.length < minLen) continue;
+      const sentences = extract.split(/(?<=[.!?])\s+/).slice(0, 2).join(' ');
+      addLog(p.title);
+      announce(p.title, sentences);
+    }
+    localStorage.setItem('rf_announced', JSON.stringify(state.announced));
+  } catch (e) {
+    $('info').textContent = 'Netzwerkfehler: ' + e.message;
+  }
+}
+
+function onPosition(pos) {
+  const lat = pos.coords.latitude, lon = pos.coords.longitude;
+  $('gpsState').textContent = 'GPS: aktiv (±' + Math.round(pos.coords.accuracy) + ' m)';
+  const here = { lat, lon };
+  if (!state.lastQueryPos || distKm(state.lastQueryPos, here) >= CFG.queryEveryKm) {
+    state.lastQueryPos = here;
+    $('info').textContent = 'Suche Sehenswürdigkeiten im Umkreis…';
+    fetchPlaces(lat, lon);
+  }
+}
+
+// ---------- WakeLock (Display anlassen) ----------
+async function requestWakeLock() {
+  try {
+    state.wakeLock = await navigator.wakeLock.request('screen');
+    state.wakeLock.addEventListener('release', () => state.wakeLock = null);
+  } catch (e) { /* nicht unterstützt -> egal */ }
+}
+document.addEventListener('visibilitychange', () => {
+  if (state.running && document.visibilityState === 'visible' && !state.wakeLock) requestWakeLock();
+});
+
+// ---------- Start/Stop ----------
+$('startBtn').addEventListener('click', async () => {
+  if (!state.running) {
+    if (!navigator.geolocation) { $('info').textContent = 'Kein GPS verfügbar.'; return; }
+    if (!('geolocation' in navigator) || !window.isSecureContext) {
+      $('info').textContent = 'Warnung: Seite läuft evtl. nicht über HTTPS – GPS wird blockiert.';
+    }
+    state.running = true;
+    $('startBtn').textContent = '■ Stop';
+    $('startBtn').classList.add('stop');
+    await requestWakeLock();
+    state.watchId = navigator.geolocation.watchPosition(onPosition, err => {
+      $('info').textContent = 'GPS-Fehler: ' + err.message;
+    }, { enableHighAccuracy: true, maximumAge: 5000 });
+    $('info').textContent = 'GPS wird aktiviert…';
+    if (speechSynthesis.paused) speechSynthesis.resume();
+  } else {
+    state.running = false;
+    navigator.geolocation.clearWatch(state.watchId);
+    speechSynthesis.cancel();
+    if (state.wakeLock) state.wakeLock.release();
+    $('startBtn').textContent = '▶ Start';
+    $('startBtn').classList.remove('stop');
+    $('gpsState').textContent = 'GPS: inaktiv';
+    $('info').textContent = 'Gestoppt.';
+  }
+});
+
+// ---------- UI-Kleinigkeiten ----------
+$('radiusInput').addEventListener('input', e => $('radiusVal').textContent = e.target.value);
+$('lenInput').addEventListener('input', e => $('lenVal').textContent = e.target.value);
+$('resetBtn').addEventListener('click', () => {
+  state.announced = {};
+  localStorage.removeItem('rf_announced');
+  $('log').innerHTML = '';
+  $('info').textContent = 'Erinnerung zurückgesetzt.';
+});
+function addLog(title) {
+  const li = document.createElement('li');
+  li.innerHTML = '<b>' + title + '</b>';
+  $('log').prepend(li);
+  while ($('log').children.length > 30) $('log').lastChild.remove();
+}
+
+// ---------- Service Worker registrieren ----------
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}
+</script>
+</body>
+</html>
+```
+
+---
+
+## manifest.json
+
+```json
+{
+  "name": "Reiseführer",
+  "short_name": "Reiseführer",
+  "description": "Ansagen zu Sehenswürdigkeiten während der Fahrt",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#101418",
+  "theme_color": "#6d4aff",
+  "lang": "de",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
+```
+
+---
+
+## sw.js
+
+```javascript
+const CACHE = 'reisefuehrer-v1';
+
+self.addEventListener('install', e => {
+  e.waitUntil(
+    caches.open(CACHE).then(c => c.addAll(['./', './index.html', './manifest.json', './icon.svg']))
+  );
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', e => {
+  e.waitUntil(
+    caches.keys().then(keys =>
+      Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))
+    )
+  );
+  self.clients.claim();
+});
+
+self.addEventListener('fetch', e => {
+  const url = e.request.url;
+
+  // Wikipedia: Netz zuerst, Antwort für Offline-Gebiete cachen
+  if (url.includes('wikipedia.org')) {
+    e.respondWith(
+      fetch(e.request).then(res => {
+        const copy = res.clone();
+        caches.open(CACHE).then(c => c.put(e.request, copy));
+        return res;
+      }).catch(() => caches.match(e.request))
+    );
+    return;
+  }
+
+  // App-Dateien: Cache zuerst
+  e.respondWith(
+    caches.match(e.request).then(hit => hit || fetch(e.request))
+  );
+});
+```
+
+---
+
+## icon.svg
+
+```svg
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="96" fill="#6d4aff"/>
+  <circle cx="256" cy="256" r="150" fill="none" stroke="#fff" stroke-width="24"/>
+  <polygon points="256,140 300,300 256,268 212,300" fill="#ffd54d"
+           stroke="#fff" stroke-width="10" stroke-linejoin="round"/>
+  <circle cx="256" cy="256" r="14" fill="#fff"/>
+</svg>
+```
