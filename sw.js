@@ -1,7 +1,3 @@
-
-## sw.js
-
-```javascript
 const CACHE = 'reisefuehrer-v1';
 
 self.addEventListener('install', e => {
@@ -40,18 +36,3 @@ self.addEventListener('fetch', e => {
     caches.match(e.request).then(hit => hit || fetch(e.request))
   );
 });
-```
-
----
-
-## icon.svg
-
-```svg
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <rect width="512" height="512" rx="96" fill="#6d4aff"/>
-  <circle cx="256" cy="256" r="150" fill="none" stroke="#fff" stroke-width="24"/>
-  <polygon points="256,140 300,300 256,268 212,300" fill="#ffd54d"
-           stroke="#fff" stroke-width="10" stroke-linejoin="round"/>
-  <circle cx="256" cy="256" r="14" fill="#fff"/>
-</svg>
-```
